@@ -1,0 +1,91 @@
+#------------------------------------------------------------------------------
+# written by: mcdaniel
+# date: june-2022
+#
+#------------------------------------------------------------------------------
+name: Deploy Open edX to Kubernetes
+branding:
+  icon: 'cloud'
+  color: 'orange'
+inputs:
+  environment-id:
+    description: 'The Open edX platform environment. Examples: prod, qa, dev'
+    required: true
+    type: string
+  namespace:
+    description: 'The Kubernetes namespace to which the Open edX platform environment will be deployed. Example: openedx-prod'
+    required: true
+    type: string
+
+runs:
+  using: "composite"
+  steps:
+    # ---------------------------------------------------------------------------------
+    # Configure k8s add-on resources
+    #
+    # note that the Kubernetes additional config data is locally
+    # stored in ci/tutor-deploy/environments/prod/k8s/
+    # in Kubernetes manifest yaml format
+    # ---------------------------------------------------------------------------------
+    - name: set environment variables
+      shell: bash
+      run: |-
+        echo "CONFIG_PATH=$(tutor config printroot)/env/apps/openedx/config" >> $GITHUB_ENV
+
+    # mcdaniel jan-2023: we'll probably deprecate this given that all of the
+    #                    manifests have to moved to terraform.
+    #
+    #- name: Create Kubernetes add-on resources
+    #  shell: bash
+    #  run:  |-
+    #    # Create kubernetes ingress and other environment resources
+    #    kubectl apply -f "ci/tutor-deploy/environments/${{ inputs.environment-id }}/k8s"
+
+    #------------------------------------------------------------------------
+    # IV. Merge all of the configuration data into Tutor's Open edX
+    #     configuration files: config.yml, lms.env.yml, cms.env.yml
+    #
+    # In this step we're combining three sources of data:
+    # 1. sensitive configuration data retrieved from Kubernetes secrets in section II above
+    # 2. Open edx application and services configuration data created here in section III
+    # 3. LMS and CMS application configuration data stored in our repo at ci/tutor-deploy/environments/prod/settings_merge.yml
+    #------------------------------------------------------------------------
+    - name: cat settings_merge.yml
+      shell: bash
+      run:  cat -n $GITHUB_WORKSPACE/ci/tutor-deploy/environments/${{ inputs.environment-id }}/settings_merge.yml
+
+    - name: Patch lms.env.yml
+      shell: bash
+      run:  |-
+        cd ${CONFIG_PATH}
+        mv lms.env.yml lms.env.yml.orig
+        yq ea '. as $item ireduce ({}; . * $item )' lms.env.yml.orig  "$GITHUB_WORKSPACE/ci/tutor-deploy/environments/${{ inputs.environment-id }}/settings_merge.yml" >  lms.env.yml
+
+    - name: Patch cms.env.yml
+      shell: bash
+      run:  |-
+        cd ${CONFIG_PATH}
+        mv cms.env.yml cms.env.yml.orig
+        yq ea '. as $item ireduce ({}; . * $item )' cms.env.yml.orig  "$GITHUB_WORKSPACE/ci/tutor-deploy/environments/${{ inputs.environment-id }}/settings_merge.yml" >  cms.env.yml
+
+    - name: cleanup config folder
+      shell: bash
+      run: |-
+        cd ${CONFIG_PATH}
+        rm *orig
+
+    - name: Dump tutor config
+      uses: openedx-actions/tutor-print-dump@v0.0.3
+
+    #------------------------------------------------------------------------
+    # V. Deploy Open edX
+    #------------------------------------------------------------------------
+    - name: Deploy Tutor
+      shell: bash
+      run:  |-
+        tutor k8s start
+
+    - name: Run tutor init
+      shell: bash
+      run:  |-
+        tutor k8s init

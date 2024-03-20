@@ -1,0 +1,3 @@
+LMS_HOSTNAME=courses.devdatalabs.com
+CMS_HOSTNAME=studio.courses.devdatalabs.com
+MFE_HOSTNAME=apps.courses.devdatalabs.com

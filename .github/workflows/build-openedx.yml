@@ -1,0 +1,119 @@
+#------------------------------------------------------------------------------
+# written by: mcdaniel
+# date: june-2022
+#
+# usage: top-level workflow. Initiated manually from Github Actions console page
+#        Builds all Docker containers.
+#------------------------------------------------------------------------------
+name: Build openedx container
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      NAMESPACE: prod-usa-prod
+      EKS_CLUSTER_NAME: prod-usa-service
+      OPENEDX_RELEASE_BRANCH: open-release/quince.master
+      OPENEDX_RELEASE_TAG: open-release/quince.1
+      OPENEDX_RELEASE_VERSION: v17
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      #------------------------------------------------------------------------
+      # install and configure tutor
+      #------------------------------------------------------------------------
+      - name: Initialize environment
+        uses: openedx-actions/tutor-k8s-init@v1
+        with:
+          eks-namespace: ${{ env.NAMESPACE }}
+          eks-cluster-name: ${{ env.EKS_CLUSTER_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+          tutor-version: "17.0.0"
+          tutor-mfe-version: "17.0.0"
+          kubectl-version: "1.29"
+
+      #------------------------------------------------------------------------
+      # un-comment this to pin your build to a specific open edx release.
+      #
+      # a word of caution: usually you're better off choosing a version of tutor
+      # and then letting tutor make decisions of this nature.
+      # see: https://discuss.openedx.org/t/how-to-move-through-tutor-versions-part-ii/9574
+      #------------------------------------------------------------------------
+      #- name: Set OPENEDX_COMMON_VERSION
+      #  shell: bash
+      #  run: |-
+      #    echo "TUTOR_OPENEDX_COMMON_VERSION=open-release/quince.1" >> $GITHUB_ENV
+
+      #------------------------------------------------------------------------
+      # Add a custom theme here.
+      #------------------------------------------------------------------------
+      - name: Add a custom theme
+        uses: openedx-actions/tutor-plugin-build-openedx-add-theme@v1
+        with:
+          repository: edx-theme-example
+          repository-organization: cookiecutter-openedx
+          repository-ref: main
+          # UN-COMMENT THIS IF YOUR REPO IS PRIVATE.
+          #----------------------------------------------
+          #repository-token: ${{ secrets.PAT }}
+          #----------------------------------------------
+
+      #------------------------------------------------------------------------
+      # Add any Python requirements here.
+      # These include:
+      # - generic Python PyPi packages
+      # - Xblocks
+      # - Open edX Plugin(s)
+      # - your own custom repos
+      #
+      # note that `repository-token` is optional and is only needed for
+      # private repositories
+      #------------------------------------------------------------------------
+      - name: Add an Open edX Plugin PyPi Package - cookiecutter-openedx-plugin
+        uses: openedx-actions/tutor-plugin-build-openedx-add-requirement@v1
+        with:
+          pip-package: cookiecutter-openedx-plugin
+          pip-package-version: "0.1.3"
+
+      - name: Add an Open edX Plugin from source - openedx-plugin-example
+        uses: openedx-actions/tutor-plugin-build-openedx-add-requirement@v1
+        with:
+          repository: openedx-plugin-example
+          repository-organization: cookiecutter-openedx
+          repository-ref: main
+          # UN-COMMENT THIS IF YOUR REPO IS PRIVATE.
+          #----------------------------------------------
+          #repository-token: ${{ secrets.PAT }}
+          #----------------------------------------------
+
+      - name: Add the edx-ora2 Xblock
+        uses: openedx-actions/tutor-plugin-build-openedx-add-requirement@v1
+        with:
+          pip-package: ora2
+          pip-package-version: "6.0.20"
+
+      - name: Dump tutor config
+        uses: openedx-actions/tutor-print-dump@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          action: build
+
+      #------------------------------------------------------------------------
+      # Build and upload the Docker container
+      #------------------------------------------------------------------------
+      - name: Build openedx
+        uses: openedx-actions/tutor-plugin-build-openedx@v1
+        with:
+          aws-ecr-repository: openedx-${{ env.OPENEDX_RELEASE_VERSION}}

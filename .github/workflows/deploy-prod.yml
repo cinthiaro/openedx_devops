@@ -1,0 +1,354 @@
+#------------------------------------------------------------------------------
+# written by: mcdaniel
+# date: june-2022
+#
+# usage: top-level workflow. Initiated manually from Github Actions console page
+#        Deploys a Tutor-created openedx Docker image to the Kubernetes cluster.
+#------------------------------------------------------------------------------
+name: Deploy prod prod
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      # common settings
+      # --------------------------------------------
+      DEBUG_MODE: false
+      AWS_REGION: us-east-1
+
+      # environment settings
+      # --------------------------------------------
+      ENVIRONMENT_ID: prod
+      NAMESPACE: prod-usa-prod
+      EKS_CLUSTER_NAME: prod-usa-service
+      S3_BUCKET_PREFIX: prod-usa-prod
+      OPENEDX_RELEASE_BRANCH: open-release/quince.master
+      OPENEDX_RELEASE_TAG: open-release/quince.1
+      OPENEDX_RELEASE_VERSION: v17
+
+      # feature flags for optional tutor modules
+      # --------------------------------------------
+      ENABLE_S3: true
+      ENABLE_DISCOVERY: false
+      
+      ENABLE_SMTP: true
+      ENABLE_BACKUP: false
+      ENABLE_CREDENTIALS: false
+      ENABLE_ECOMMERCE: false
+      
+      ENABLE_FORUM: true
+      ENABLE_NOTES: false
+      ENABLE_XQUEUE: false
+      
+      ENABLE_LICENSE_MANAGER: false
+      
+      
+      ENABLE_CODEJAIL: false
+      
+
+    # deployment workflow begins here
+    # --------------------------------------------
+    steps:
+      # checkout github repos: this repo, plus, all Gihubs Actions repos in this workflow
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # AWS helper method. creates a session token that's usable by all other
+      # aws-actions. Prevents us from having to explicitly provide authentication credentials
+      # to each aws-actions method individually.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Open edX Github Actions init procedure. Provides reliable initializations of
+      # kubectl, aws-cli and tutor
+      - name: Initialize environment
+        uses: openedx-actions/tutor-k8s-init@v1
+        with:
+          eks-namespace: ${{ env.NAMESPACE }}
+          eks-cluster-name: ${{ env.EKS_CLUSTER_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+          tutor-version: "17.0.0"
+          tutor-mfe-version: "17.0.0"
+          kubectl-version: "1.29"
+
+      # Setup a connection to our AWS Elastic Container Registry so that we can pull
+      # containers that we created with the build workflows in this Cookiecutter.
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------------------------------------------------------------------------------
+      # initialize workflow environment variables
+      # ---------------------------------------------------------------------------------
+      - name: Intialize AWS_ECR_URI
+        shell: bash
+        run: |-
+          echo "AWS_ECR_URI=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_ENV
+
+      - name: Intialize AWS ECR repo URIs
+        shell: bash
+        run: |-
+          echo "AWS_ECR_REPOSITORY_BACKUP=${AWS_ECR_URI}/openedx_backup:latest" >> $GITHUB_ENV
+          echo "AWS_ECR_REPOSITORY_CREDENTIALS=${AWS_ECR_URI}/openedx_credentials:latest" >> $GITHUB_ENV
+          echo "AWS_ECR_REPOSITORY_LICENSE_MANAGER=${AWS_ECR_URI}/license_manager:latest" >> $GITHUB_ENV
+          echo "AWS_ECR_REPOSITORY_OPENEDX=${AWS_ECR_URI}/openedx-${{ env.OPENEDX_RELEASE_VERSION }}:latest" >> $GITHUB_ENV
+
+      - name: Load environment specific settings (direct)
+        shell: bash
+        run: |-
+          # Pin the instalation ID with the Kubernetes namespace. It needs to be unique and static per instalation.
+          cat ci/tutor-deploy/environments/${{ env.ENVIRONMENT_ID }}/config.yml >> $GITHUB_ENV
+
+      # note that values like $LMS_HOSTNAME come from this repo
+      # in /ci/tutor-deploy/environments/staging/config.yml
+      #
+      - name: Set the Open edX runtime version and base domains
+        shell: bash
+        run: |-
+          echo "TUTOR_LMS_HOST=$LMS_HOSTNAME" >> $GITHUB_ENV
+          echo "TUTOR_CMS_HOST=$CMS_HOSTNAME" >> $GITHUB_ENV
+          echo "TUTOR_DOCKER_IMAGE_OPENEDX=${AWS_ECR_REPOSITORY_OPENEDX}" >> $GITHUB_ENV
+
+      - name: Codejail environment settings
+        id: codejail-env-settings
+        if: ${{ env.ENABLE_CODEJAIL == 'true' }}
+        shell: bash
+        run: |-
+          echo "TUTOR_CODEJAIL_ENFORCE_APPARMOR=false" >> $GITHUB_ENV
+          echo "TUTOR_CODEJAIL_ENABLE_K8S_DAEMONSET=false" >> $GITHUB_ENV
+          echo "TUTOR_CODEJAIL_SKIP_INIT=false" >> $GITHUB_ENV
+
+      # see: https://docs.tutor.overhang.io/configuration.html
+      - name: Override backend service versions
+        shell: bash
+        run: |-
+          echo "TUTOR_DOCKER_IMAGE_ELASTICSEARCH=docker.io/elasticsearch:7.17.9" >> $GITHUB_ENV
+
+      #------------------------------------------------------------------------
+      # un-comment this to pin your deployment to a specific open edx release.
+      #
+      # a word of caution: usually you're better off choosing a version of tutor
+      # and then letting tutor make decisions of this nature.
+      # see: https://discuss.openedx.org/t/how-to-move-through-tutor-versions-part-ii/9574
+      #------------------------------------------------------------------------
+      #- name: Set OPENEDX_COMMON_VERSION
+      #  shell: bash
+      #  run: |-
+      #    echo "TUTOR_OPENEDX_COMMON_VERSION=open-release/quince.1" >> $GITHUB_ENV
+
+      # ---------------------------------------------------------------------------------
+      # Configure optional tutor plugins
+      # ---------------------------------------------------------------------------------
+      - name: Enable tutor plugin - S3
+        uses: openedx-actions/tutor-plugin-enable-s3@v1
+        if: ${{ env.ENABLE_S3 == 'true' }}
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+      - name: Enable tutor plugin - Backup
+        uses: openedx-actions/tutor-plugin-enable-backup@v0
+        if: ${{ env.ENABLE_BACKUP == 'true' }}
+        with:
+          aws-ecr-uri: ${AWS_ECR_REPOSITORY_BACKUPS}
+          namespace: ${{ env.NAMESPACE }}
+
+      # -----------------------------------------------------------------------
+      # NOTE: the major version of tutor-discovery must be consistent with
+      #       the version of tutor that is managing the overall installation.
+      #       for example: if you've installed tutor v14.2.3 then you should
+      #       install tutor-discovery v14.0.2
+      #
+      #       refer to https://pypi.org/project/tutor-discovery/#history
+      #       for a list of available versions.
+      # -----------------------------------------------------------------------
+      - name: Enable tutor plugin - Discovery
+        uses: openedx-actions/tutor-plugin-enable-discovery@v1
+        if: ${{ env.ENABLE_DISCOVERY == 'true' }}
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+      - name: Enable tutor plugin - Credentials
+        uses: openedx-actions/tutor-plugin-enable-credentials@v1
+        if: ${{ env.ENABLE_CREDENTIALS == 'true' }}
+        with:
+          version: latest
+          namespace: ${{ env.NAMESPACE }}
+          aws-ecr-uri: ${AWS_ECR_REPOSITORY_CREDENTIALS}
+          common-logo-url: https://www.edx.org/images/logos/edx-logo-elm.svg
+
+      - name: Enable tutor plugin - Xqueue
+        uses: openedx-actions/tutor-plugin-enable-xqueue@v1
+        if: ${{ env.ENABLE_XQUEUE == 'true' }}
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          tutor-xqueue-version: latest
+
+      - name: Enable tutor plugin - Notes
+        uses: openedx-actions/tutor-plugin-enable-notes@v1
+        if: ${{ env.ENABLE_NOTES == 'true' }}
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+      - name: Enable tutor plugin - Ecommerce
+        uses: openedx-actions/tutor-plugin-enable-ecommerce@v1
+        if: ${{ env.ENABLE_ECOMMERCE == 'true' }}
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          tutor-ecommerce-version: latest
+          secrets-s3-bucket-name: ${{ env.S3_BUCKET_PREFIX }}-secrets
+          currency: USD
+          enabled-payment-processors: '["stripe", "paypal"]'
+
+      # -----------------------------------------------------------------------
+      # NOTE: the major version of tutor-forum must be consistent with
+      #       the version of tutor that is managing the overall installation.
+      #       for example: if you've installed tutor v14.2.3 then you should
+      #       install tutor-forum v14.0.0
+      #
+      #       refer to https://pypi.org/project/tutor-forum/#history
+      #       for a list of available versions.
+      # -----------------------------------------------------------------------
+      - name: Enable tutor plugin - Forum
+        uses: openedx-actions/tutor-plugin-enable-forum@v1
+        if: ${{ env.ENABLE_FORUM == 'true' }}
+
+      - name: Enable tutor plugin - License Manager
+        uses: openedx-actions/tutor-enable-plugin-license-manager@v0
+        if: ${{ env.ENABLE_LICENSE_MANAGER == 'true' }}
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          aws-ecr-uri: ${AWS_ECR_REPOSITORY_LICENSE_MANAGER}
+          host: subscriptions.courses.devdatalabs.com
+          lms_host: courses.devdatalabs.com
+
+      - name: Install tutor-contrib-codejail
+        id: install-tutor-contrib-codejail
+        if: ${{ env.ENABLE_CODEJAIL == 'true' }}
+        shell: bash
+        run: |
+          pip install git+https://github.com/lpm0073/tutor-contrib-codejail@mcdaniel-202401
+          tutor plugins enable codejail
+
+      # ***********************************************************************
+      # Configure backend services
+      # ***********************************************************************
+      - name: Configure Redis
+        uses: openedx-actions/tutor-k8s-configure-redis@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+      - name: Configure MySQL
+        uses: openedx-actions/tutor-k8s-configure-mysql@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+      - name: Configure MongoDB
+        uses: openedx-actions/tutor-k8s-configure-mongodb@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          remote-server: "true"
+          
+
+      - name: Configure AWS SES
+        if: ${{ env.ENABLE_SMTP == 'true' }}
+        uses: openedx-actions/tutor-k8s-configure-ses@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+      # ---------------------------------------------------------------------------------
+      # Configure application secrets
+      # ---------------------------------------------------------------------------------
+      - name: Fetch JWT token
+        uses: openedx-actions/tutor-k8s-configure-jwt@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+
+      # see: https://github.com/lpm0073/openedx_devops/blob/main/terraform/modules/kubernetes_secrets/main.tf
+      - name: Configure edx secret
+        uses: openedx-actions/tutor-k8s-configure-edx-secret@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+
+      # -----------------------------------------------------------------------
+      # ENABLE_WEB_PROXY=false: to disable Caddy
+      # RUN_CADDY=false:
+      # ENABLE_HTTPS=true: to set HTTPS='on' in production.py
+      # -----------------------------------------------------------------------
+      - name: Disable Caddy web proxy service
+        shell: bash
+        run:  |-
+          tutor config save --set ENABLE_WEB_PROXY=false \
+                            --set ENABLE_HTTPS=true \
+                            --set RUN_CADDY=false
+
+      # ---------------------------------------------------------------------------------
+      # install and enable tutor plugin https://github.com/lpm0073/tutor-contrib-k8s-deploy-tasks
+      # this resolves any problems that cannot be address by directly manipulating tutor's
+      # config.yml and/or the resources that it generates in its lms and cms working folders.
+      #
+      # this includes the following:
+      # ----------------------------
+      # 1. oauth misconfiguration. tutor relies on an environment variable ENABLE_HTTPS to determine the protocol of the
+      # production oauth client for applications that rely on the LMS oauth service. For Kubernetes installations however,
+      # this value needs to be set to false which results in ./manage.py lms create_dot_application misconfiguring the oauth
+      # client for some, but not all, of these oauth clients. This plugin reconfigures the oauth clients of cms,
+      # discovery, ecommerce and credentials to use https protocol for redirect URI.
+
+      # 2. Nutmeg upgrade and initializataion tasks There are a few manage.py tasks that need to run for platforms that are
+      # upgrading to Nutmeg or newer from Maple or older. This plugin runs those tasks for you. For more information see
+      # Open edX Nutmeg Release.
+
+      # 3. Missing user profile records. User accounts created with manage.py lack a corresponding auth_userprofile record,
+      # which causes a 500 exception during login for that account. Adds a blank record in cases where a record is missing.
+
+      # 4. MFE misconfiguration. tutor-mfe relies on the value of ENABLE_HTTPS when generating the dict MFE_CONFIG,
+      # which in the case of k8s deployments will result in the browser blocking content due to "Mixed content".
+      # This plugin overrides the results of tutor-mfe openedx-lms-production-settings, replacing protocol produced
+      # by logic relying on ENABLE_HTTPS (assumed to result in 'http') with the hard-coded value 'https'.
+      #
+      # 5. Xblock storage configuration. creates a custom storage configuration like the following
+      #      S3Boto3Storage(
+      #        bucket=AWS_STORAGE_BUCKET_NAME,
+      #        access_key=AWS_ACCESS_KEY_ID,
+      #        secret_key=AWS_SECRET_ACCESS_KEY,
+      #        querystring_expire=86400,
+      #        custom_domain=f"{domain}/scorm-proxy"
+      #      )
+      # ---------------------------------------------------------------------------------
+      - name: Add tutor k8s-specific deployment tasks
+        uses: openedx-actions/tutor-plugin-enable-k8s-deploy-tasks@v1
+        with:
+          tutor-plugin-version: "17.0.0"
+
+      - name: Dump tutor config
+        uses: openedx-actions/tutor-print-dump@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          action: deploy
+
+      # -----------------------------------------------------------------------
+      # Deploy
+      # -----------------------------------------------------------------------
+      - name: Deploy to Kubernetes
+        uses: ./.github/actions/tutor/k8s/deploy
+        with:
+          environment-id: ${{ env.ENVIRONMENT_ID }}
+          namespace: ${{ env.NAMESPACE }}
+
+      - name: Set theme
+        uses: openedx-actions/tutor-k8s-configure-edx-set-theme@v0
+        with:
+          theme-name: edx-theme-example
+
+      - name: Create admin user
+        uses: openedx-actions/tutor-k8s-configure-edx-admin@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}

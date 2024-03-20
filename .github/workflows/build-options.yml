@@ -1,0 +1,73 @@
+#------------------------------------------------------------------------------
+# written by: mcdaniel
+# date: june-2022
+#
+# usage: top-level workflow. Initiated manually from Github Actions console page
+#        Builds all Docker containers.
+#------------------------------------------------------------------------------
+name: Build Optional Containers
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ENABLE_MFE: true
+      ENABLE_BACKUP: false
+      ENABLE_CREDENTIALS: false
+      ENABLE_LICENSE_MANAGER: false
+
+      # environment settings
+      # --------------------------------------------
+      SUBDOMAIN: courses
+      DOMAIN_NAME: devdatalabs.com
+      SITE_NAME: prod
+      AWS_REGION: us-east-1
+      ENVIRONMENT_ID: prod
+      NAMESPACE: prod-usa-prod
+      EKS_CLUSTER_NAME: prod-usa-service
+      S3_BUCKET_PREFIX: prod-usa-prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Initialize environment
+        uses: openedx-actions/tutor-k8s-init@v1
+        with:
+          eks-namespace: ${{ env.NAMESPACE }}
+          eks-cluster-name: ${{ env.EKS_CLUSTER_NAME }}
+          aws-region: ${{ env.AWS_REGION }}
+          tutor-version: "17.0.0"
+          tutor-mfe-version: "17.0.0"
+          kubectl-version: "1.29"
+
+      - name: Build MFE
+        if: ${{ env.ENABLE_MFE == 'true' }}
+        uses: openedx-actions/tutor-plugin-build-mfe@v0.1.6
+
+      - name: Build Backup
+        if: ${{ env.ENABLE_BACKUP == 'true' }}
+        uses: openedx-actions/tutor-plugin-build-backup@v0
+
+      - name: Build Credentials
+        if: ${{ env.ENABLE_CREDENTIALS == 'true' }}
+        uses: openedx-actions/tutor-plugin-build-credentials@v1
+        with:
+          version: latest
+          aws-ecr-repo: openedx_credentials
+
+      - name: Build License Manager
+        if: ${{ env.ENABLE_LICENSE_MANAGER == 'true' }}
+        uses: openedx-actions/tutor-plugin-build-license-manager@v0
